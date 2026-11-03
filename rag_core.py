@@ -1,10 +1,6 @@
 import hashlib
 import json
-import math
 import os
-import re
-import unicodedata
-from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,7 +11,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-RETRIEVAL = os.getenv("RETRIEVAL", "embeddings").lower()
 EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-small")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 SUPPORTED = {".pdf", ".txt", ".md"}
@@ -50,77 +45,6 @@ def make_embeddings() -> Embeddings:
     return E5Embeddings(EMBED_MODEL)
 
 
-
-# ---------- Recherche BM25 (aucun téléchargement de modèle) ----------
-STOPWORDS = set("""le la les un une des du de d l et ou mais donc or ni car a à au aux en dans sur sous par pour
-avec sans ce cet cette ces se sa son ses leur leurs je tu il elle on nous vous ils elles que qui quoi dont où est sont
-etre ete avoir ai as ont avait the of and to in is are it that for on with as by be""".split())
-
-
-def stem(t: str) -> str:
-    """Retire un seul « s » ou « x » final (pluriels), sans toucher aux mots en -ss, -us, -is."""
-    if len(t) > 4 and t[-1] in "sx" and t[-2:] not in ("ss", "us", "is"):
-        return t[:-1]
-    return t
-
-
-def tokenize(text: str) -> list[str]:
-    text = "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
-    return [stem(t) for t in re.findall(r"\w+", text) if t not in STOPWORDS and len(t) > 1]
-
-
-class BM25Store:
-    """Même interface que InMemoryVectorStore (add_documents, delete, similarity_search_with_score,
-    dump, load) mais basé sur BM25 : la recherche repose sur les mots communs avec la question."""
-
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
-        self.k1, self.b = k1, b
-        self.docs: dict[str, Document] = {}
-        self._tf: dict[str, Counter] = {}
-
-    def add_documents(self, docs: list[Document], ids: list[str]):
-        for d, i in zip(docs, ids):
-            self.docs[i] = d
-            self._tf[i] = Counter(tokenize(d.page_content))
-
-    def delete(self, ids: list[str]):
-        for i in ids:
-            self.docs.pop(i, None)
-            self._tf.pop(i, None)
-
-    def similarity_search_with_score(self, query: str, k: int = 5):
-        n = len(self.docs)
-        if not n:
-            return []
-        lens = {i: sum(tf.values()) for i, tf in self._tf.items()}
-        avg = sum(lens.values()) / n or 1
-        df = Counter(t for tf in self._tf.values() for t in tf)
-        scored = []
-        for i, tf in self._tf.items():
-            s = 0.0
-            for t in set(tokenize(query)):
-                if t in tf:
-                    idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
-                    s += idf * tf[t] * (self.k1 + 1) / (
-                        tf[t] + self.k1 * (1 - self.b + self.b * lens[i] / avg))
-            if s > 0:
-                scored.append((self.docs[i], s))
-        return sorted(scored, key=lambda x: -x[1])[:k]
-
-    def dump(self, path: str):
-        Path(path).write_text(json.dumps(
-            {i: {"page_content": d.page_content, "metadata": d.metadata} for i, d in self.docs.items()},
-            ensure_ascii=False), encoding="utf-8")
-
-    @classmethod
-    def load(cls, path: str) -> "BM25Store":
-        store = cls()
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        store.add_documents([Document(page_content=v["page_content"], metadata=v["metadata"])
-                             for v in data.values()], list(data))
-        return store
-
-
 # ---------- Lecture des fichiers ----------
 def load_documents(path: Path) -> list[Document]:
     """PDF -> un Document par page ; TXT/MD -> un seul Document."""
@@ -144,15 +68,11 @@ class KnowledgeBase:
         self.index_dir = Path(index_dir)
         self.corpus.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
-        self.embeddings = embeddings
-        if embeddings is None and RETRIEVAL == "embeddings":
-            self.embeddings = make_embeddings()
-        # mode BM25 si aucun modèle d'embeddings n'est utilisé
-        self.model_name = ("bm25" if self.embeddings is None
-                           else getattr(self.embeddings, "name", type(self.embeddings).__name__))
+        self.embeddings = embeddings or make_embeddings()
+        self.model_name = getattr(self.embeddings, "name", type(self.embeddings).__name__)
         self.splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
         self.docs: dict[str, dict] = {}     # nom -> {"hash": ..., "ids": [...]}
-        self.vs = None  # BM25Store ou InMemoryVectorStore
+        self.vs = None                      # InMemoryVectorStore
         self._load()
 
     # -- persistance --
@@ -168,8 +88,7 @@ class KnowledgeBase:
         if meta.get("model") != self.model_name:   # autre modèle : tout sera ré-indexé
             return
         self.docs = meta["docs"]
-        self.vs = (BM25Store.load(str(self._vs_path)) if self.embeddings is None
-                   else InMemoryVectorStore.load(str(self._vs_path), self.embeddings))
+        self.vs = InMemoryVectorStore.load(str(self._vs_path), self.embeddings)
 
     def _save(self):
         if self.vs is None:
@@ -217,7 +136,7 @@ class KnowledgeBase:
             new_ids += ids
         if new_docs:
             if self.vs is None:
-                self.vs = BM25Store() if self.embeddings is None else InMemoryVectorStore(self.embeddings)
+                self.vs = InMemoryVectorStore(self.embeddings)
             self.vs.add_documents(new_docs, ids=new_ids)
         if not self.n_chunks:
             self.vs = None
@@ -239,13 +158,11 @@ class KnowledgeBase:
 
     def sample_text(self, n: int = 300) -> str:
         """Court extrait du corpus (donne au modèle la langue et le vocabulaire des documents)."""
-        if self.vs is None:
+        first_id = next((d["ids"][0] for d in self.docs.values() if d["ids"]), None)
+        if self.vs is None or first_id is None:
             return ""
-        if hasattr(self.vs, "docs"):                       # BM25Store
-            first = next(iter(self.vs.docs.values()), None)
-            return first.page_content[:n] if first else ""
-        first = next(iter(self.vs.store.values()), None)   # InMemoryVectorStore
-        return (first or {}).get("text", "")[:n]
+        found = self.vs.get_by_ids([first_id])
+        return found[0].page_content[:n] if found else ""
 
     # -- recherche --
     def search(self, query: str, k: int = 5) -> list[dict]:
@@ -386,6 +303,7 @@ def answer_question(kb: KnowledgeBase, question: str, k: int = 5,
                      "et indiquera si l'information manque.")
     return {"answer": generate_answer(question, hits, history), "sources": hits,
             "query": used, "steps": steps}
+
 
 # ---------- Point d'entrée simple (utilisable hors Streamlit : API, script, tests) ----------
 @lru_cache(maxsize=1)  # la base n'est chargée et synchronisée qu'une seule fois
